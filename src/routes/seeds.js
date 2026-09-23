@@ -50,17 +50,20 @@ router.post("/api/admin/seeds", async (req, res, next) => {
     if (u.protected === true) return res.status(422).json({ error: `@${handle} is a private account. Its followings can't be read, so it can't be a seed.` });
 
     const xUserId = String(u.id);
+    // X gives a small 48px picture ("_normal"); ask for the 200px version instead.
+    const picture = typeof u.profilePicture === "string" && u.profilePicture.startsWith("https://")
+      ? u.profilePicture.replace("_normal.", "_200x200.") : null;
     const existing = await one("select id, status, handle from seeds where x_user_id = $1", [xUserId]);
     if (existing && existing.status !== "removed") {
       return res.status(409).json({ error: `@${existing.handle} is already a seed (${existing.status}).` });
     }
 
-    const values = [xUserId, u.userName || handle, u.name || null, typeof u.followers === "number" ? u.followers : null, seedType, notes];
+    const values = [xUserId, u.userName || handle, u.name || null, typeof u.followers === "number" ? u.followers : null, seedType, notes, picture];
     const seed = existing
       ? await one(`update seeds set x_user_id=$1, handle=$2, display_name=$3, x_followers=$4, seed_type=$5, notes=$6,
-                     status='active', updated_at=now() where id=$7 returning *`, [...values, existing.id])
-      : await one(`insert into seeds (x_user_id, handle, display_name, x_followers, seed_type, notes)
-                   values ($1,$2,$3,$4,$5,$6) returning *`, values);
+                     profile_image=$7, status='active', updated_at=now() where id=$8 returning *`, [...values, existing.id])
+      : await one(`insert into seeds (x_user_id, handle, display_name, x_followers, seed_type, notes, profile_image)
+                   values ($1,$2,$3,$4,$5,$6,$7) returning *`, values);
 
     await activity("seeds", `Seed added: @${seed.handle} (${seedType})`, { x_user_id: xUserId, followers: seed.x_followers });
     res.json({ seed, summary: await seedSummary() });
