@@ -11,6 +11,7 @@ import auth from "./routes/auth.js";
 import seeds from "./routes/seeds.js";
 import settings from "./routes/settings.js";
 import crawler from "./routes/crawler.js";
+import leads from "./routes/leads.js";
 import { startCrawler, stopCrawler } from "./crawler/runner.js";
 
 const app = express();
@@ -31,6 +32,7 @@ app.use(auth);
 app.use(seeds);
 app.use(settings);
 app.use(crawler);
+app.use(leads);
 
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 app.use((err, _req, res, _next) => {
