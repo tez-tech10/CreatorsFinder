@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { query, one, activity } from "../lib/db.js";
 import { requireAdmin } from "../middleware/session.js";
+import { config } from "../config.js";
 
 const router = Router();
 router.use("/api/admin/settings", requireAdmin);
@@ -24,10 +25,17 @@ const RULES = {
   max_followings_per_account: { min: 100, max: 10_000 },
   daily_budget_usd:           { min: 0, max: 10_000 },
   llm_batch_size:             { min: 1, max: 25 },
+  ig_min_followers:           { min: 0, max: 100_000_000 },
+};
+
+const LABELS = {
+  follower_min: "Disqualify below (X followers)",
+  follower_max: "No Instagram check from (X followers)",
+  ig_min_followers: "Instagram followers needed",
 };
 
 router.get("/api/admin/settings", async (_req, res, next) => {
-  try { res.json({ settings: await one("select * from settings where id = 1") }); }
+  try { res.json({ settings: await one("select * from settings where id = 1"), apify_connected: !!config.apifyToken }); }
   catch (e) { next(e); }
 });
 
@@ -40,7 +48,7 @@ router.patch("/api/admin/settings", async (req, res, next) => {
     for (const [k, r] of Object.entries(RULES)) {
       if (b[k] === undefined) continue;
       const n = Number(b[k]);
-      if (!Number.isFinite(n) || n < r.min || n > r.max) return res.status(400).json({ error: `${k.replace(/_/g, " ")} must be between ${r.min} and ${r.max}.` });
+      if (!Number.isFinite(n) || n < r.min || n > r.max) return res.status(400).json({ error: `${LABELS[k] || k.replace(/_/g, " ")} must be between ${r.min} and ${r.max}.` });
       next_[k] = k === "daily_budget_usd" ? Math.round(n * 100) / 100 : Math.round(n);
     }
     if (b.crawl_mode !== undefined) {
@@ -48,7 +56,8 @@ router.patch("/api/admin/settings", async (req, res, next) => {
       next_.crawl_mode = b.crawl_mode;
     }
     if (b.collect_without_email !== undefined) next_.collect_without_email = !!b.collect_without_email;
-    if (!(next_.follower_max > next_.follower_min)) return res.status(400).json({ error: "Max followers must be higher than min followers." });
+    if (b.ig_check_enabled !== undefined) next_.ig_check_enabled = !!b.ig_check_enabled;
+    if (!(next_.follower_max > next_.follower_min)) return res.status(400).json({ error: "\"No Instagram check from\" must be higher than \"Disqualify below\"." });
 
     if (b.crawler_enabled !== undefined) {
       const on = !!b.crawler_enabled;
@@ -61,10 +70,12 @@ router.patch("/api/admin/settings", async (req, res, next) => {
 
     const saved = await one(`
       update settings set follower_min=$1, follower_max=$2, active_days=$3, max_depth=$4, max_followings_per_account=$5,
-             daily_budget_usd=$6, crawl_mode=$7, collect_without_email=$8, crawler_enabled=$9, llm_batch_size=$10, updated_at=now()
+             daily_budget_usd=$6, crawl_mode=$7, collect_without_email=$8, crawler_enabled=$9, llm_batch_size=$10,
+             ig_check_enabled=$11, ig_min_followers=$12, updated_at=now()
        where id = 1 returning *`,
       [next_.follower_min, next_.follower_max, next_.active_days, next_.max_depth, next_.max_followings_per_account,
-       next_.daily_budget_usd, next_.crawl_mode, next_.collect_without_email, next_.crawler_enabled, next_.llm_batch_size]);
+       next_.daily_budget_usd, next_.crawl_mode, next_.collect_without_email, next_.crawler_enabled, next_.llm_batch_size,
+       next_.ig_check_enabled, next_.ig_min_followers]);
 
     const changes = Object.keys(saved).filter((k) => k !== "updated_at" && String(saved[k]) !== String(current[k]));
     if (changes.length) {
