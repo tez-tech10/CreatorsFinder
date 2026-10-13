@@ -54,7 +54,8 @@ async function processAccounts(rawUsers, job, settings, stats) {
     if (flag) { await store.exclude(u.id, u.handle, "age_safety_keywords", depth, seedId); stats.excluded++; continue; }
     if (u.unavailable) { reject(u, "unavailable"); continue; }
     if (u.isProtected) { reject(u, "private"); continue; }
-    if (u.followers < settings.follower_min || u.followers > settings.follower_max) { reject(u, "out_of_range"); continue; }
+    // First limit only: under it → out. Above the second limit still qualifies (it only skips the Instagram check).
+    if (u.followers < settings.follower_min) { reject(u, "out_of_range"); continue; }
     if (u.isAutomated) { reject(u, "automated"); continue; }
     u.bioLang = detectLanguage(u.bio);
     if (u.bioLang === "other") { reject(u, "not_english"); continue; }
@@ -132,7 +133,7 @@ async function processAccounts(rawUsers, job, settings, stats) {
         stats.rejected.no_email = (stats.rejected.no_email || 0) + 1;
         continue;
       }
-      await store.saveCreator(c, u.found);
+      await store.saveCreator(c, u.found, settings);
       decided.push({ x_user_id: u.id, handle: u.handle, outcome: "qualified", reason: null, depth, source_seed_id: seedId });
       qualified++;
     }
