@@ -36,6 +36,8 @@ async function processAccounts(rawUsers, job, settings, stats) {
   const byId = new Map();
   for (const u of rawUsers) { const n = normalizeUser(u); if (n && !byId.has(n.id)) byId.set(n.id, n); }
   const known = await store.knownIds([...byId.keys()]);
+  const removed = await store.removedHandles([...byId.values()].map((u) => u.handle));
+  for (const u of byId.values()) if (removed.has(String(u.handle).toLowerCase()) && !known.has(u.id)) { await store.suppressId(u.id, "removal_request"); known.add(u.id); }
   const fresh = [...byId.values()].filter((u) => !known.has(u.id));
   stats.skippedKnown += byId.size - fresh.length;
   if (!fresh.length) return 0;
