@@ -8,6 +8,7 @@ router.use("/api/admin/leads", requireAdmin);
 router.use("/api/admin/deliveries", requireAdmin);
 
 const STATUSES = ["new", "contacted", "replied", "declined", "signed", "unreachable"];
+const EMAIL_LISTS = ["eligible", "pending_ig", "under_review", "none"];
 const SORTS = {
   newest: "c.created_at desc",
   followers_desc: "c.x_followers desc nulls last",
@@ -30,7 +31,9 @@ export function buildFilters(q) {
   if (q.min_followers) add("c.x_followers >= ?", Number(q.min_followers) || 0);
   if (q.max_followers) add("c.x_followers <= ?", Number(q.max_followers) || 0);
   if (q.status && STATUSES.includes(q.status)) add("c.status = ?", q.status);
-  if (q.has_email === "1") where.push("exists (select 1 from contacts k where k.creator_id = c.id and k.type = 'email' and k.email_status <> 'invalid')");
+  // "Has email" = on the email list (plan 5.1). Other email states can be picked with email_list=…
+  if (q.has_email === "1") where.push("c.email_list = 'eligible'");
+  if (q.email_list && EMAIL_LISTS.includes(q.email_list)) add("c.email_list = ?", q.email_list);
   if (q.has_telegram === "1") where.push("exists (select 1 from contacts k where k.creator_id = c.id and k.type = 'telegram')");
   if (q.has_instagram === "1") where.push("exists (select 1 from platform_accounts p where p.creator_id = c.id and p.platform = 'instagram')");
   if (q.dm_open === "1") where.push("c.dm_open is true");
@@ -45,7 +48,7 @@ export function buildFilters(q) {
 
 const LIST_COLUMNS = `
   c.id, c.x_user_id, c.handle, c.display_name, c.x_followers, c.niche, c.tier, c.status, c.dm_open,
-  c.possibly_managed, c.profile_image, c.last_post_at, c.created_at, c.delivered_at,
+  c.possibly_managed, c.profile_image, c.last_post_at, c.created_at, c.delivered_at, c.email_list, c.ig_followers_total,
   (select k.value from contacts k where k.creator_id = c.id and k.type = 'email' and k.email_status <> 'invalid' order by k.found_at limit 1) as email,
   exists (select 1 from contacts k where k.creator_id = c.id and k.type = 'telegram') as has_telegram,
   (select p.url from platform_accounts p where p.creator_id = c.id and p.platform = 'onlyfans' limit 1) as onlyfans_url,
@@ -83,13 +86,23 @@ router.patch("/api/admin/leads/:id", async (req, res, next) => {
   try {
     const lead = await one("select id, x_user_id, handle, status from creators where id = $1", [req.params.id]);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
-    const { status, notes } = req.body || {};
+    const { status, notes, email_list } = req.body || {};
     if (status !== undefined && !STATUSES.includes(status)) return res.status(400).json({ error: "Invalid status." });
+
+    // Manual review: approve an under-review creator for the email list, or move one back to review
+    if (email_list !== undefined) {
+      if (!["eligible", "under_review"].includes(email_list)) return res.status(400).json({ error: "Invalid email list choice." });
+      const hasEmail = await one("select 1 from contacts where creator_id = $1 and type = 'email' and email_status <> 'invalid' limit 1", [lead.id]);
+      if (!hasEmail) return res.status(400).json({ error: "She has no email, so she can't go on the email list." });
+      await query("update creators set email_list = $1, email_list_reason = $2, updated_at = now() where id = $3",
+        [email_list, email_list === "eligible" ? "admin_approved" : "admin_review", lead.id]);
+      await activity("leads", `@${lead.handle} ${email_list === "eligible" ? "approved for the email list" : "moved to email review"}`);
+    }
     if (notes !== undefined && typeof notes !== "string") return res.status(400).json({ error: "Invalid notes." });
 
     const updated = await one(
       `update creators set status = coalesce($1, status), notes = case when $2::boolean then $3 else notes end, updated_at = now()
-        where id = $4 returning id, status, notes`,
+        where id = $4 returning id, status, notes, email_list, email_list_reason`,
       [status || null, notes !== undefined, notes !== undefined ? notes.slice(0, 2000) : null, lead.id]);
 
     if (status && status !== lead.status) {
@@ -123,7 +136,8 @@ router.get("/api/admin/leads-export.csv", requireAdmin, async (req, res, next) =
     await client.query("begin");
     // Lock the rows so two exports at the same time can't deliver the same lead twice
     const rows = (await client.query(
-      `select c.id, c.handle, c.display_name, c.x_followers, c.niche, c.last_post_at, c.possibly_managed
+      `select c.id, c.handle, c.display_name, c.x_followers, c.niche, c.last_post_at, c.possibly_managed,
+              c.email_list, c.ig_followers_total
          from creators c ${f.sql} order by c.created_at limit ${max} for update skip locked`, f.params)).rows;
     const ids = rows.map((r) => r.id);
     const contacts = ids.length ? (await client.query(
@@ -132,15 +146,18 @@ router.get("/api/admin/leads-export.csv", requireAdmin, async (req, res, next) =
       "select creator_id, platform, handle, url from platform_accounts where creator_id = any($1)", [ids])).rows : [];
 
     const by = (list, id, pred) => list.filter((x) => x.creator_id === id && pred(x));
-    const lines = [["x_handle", "x_profile", "name", "x_followers", "niche", "last_active", "onlyfans", "fansly", "email", "telegram", "instagram", "tiktok", "possibly_managed"]
-      .concat(includePhones ? ["phone", "whatsapp"] : [])];
+    // Email is only exported for creators on the email list (plan 5.1).
+    // Internal exports (phones=1) also show under-review emails in their own column.
+    const lines = [["x_handle", "x_profile", "name", "x_followers", "niche", "last_active", "onlyfans", "fansly", "email", "telegram", "instagram", "instagram_followers", "tiktok", "possibly_managed"]
+      .concat(includePhones ? ["phone", "whatsapp", "email_not_on_list"] : [])];
     for (const r of rows) {
       const c = (t) => by(contacts, r.id, (x) => x.type === t).map((x) => x.value).join(" | ");
       const p = (pl, field) => by(platforms, r.id, (x) => x.platform === pl).map((x) => x[field]).join(" | ");
       lines.push([r.handle, `https://x.com/${r.handle}`, r.display_name, r.x_followers, r.niche,
         r.last_post_at ? new Date(r.last_post_at).toISOString().slice(0, 10) : "", p("onlyfans", "url"), p("fansly", "url"),
-        c("email"), c("telegram"), p("instagram", "handle"), p("tiktok", "handle"), r.possibly_managed ? "yes" : "no"]
-        .concat(includePhones ? [c("phone"), c("whatsapp")] : []));
+        r.email_list === "eligible" ? c("email") : "", c("telegram"), p("instagram", "handle"), r.ig_followers_total ?? "",
+        p("tiktok", "handle"), r.possibly_managed ? "yes" : "no"]
+        .concat(includePhones ? [c("phone"), c("whatsapp"), r.email_list === "eligible" ? "" : c("email")] : []));
     }
 
     if (mark && ids.length) {
