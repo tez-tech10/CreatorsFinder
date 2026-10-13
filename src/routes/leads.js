@@ -48,7 +48,7 @@ export function buildFilters(q) {
 
 const LIST_COLUMNS = `
   c.id, c.x_user_id, c.handle, c.display_name, c.x_followers, c.niche, c.tier, c.status, c.dm_open,
-  c.possibly_managed, c.profile_image, c.last_post_at, c.created_at, c.delivered_at, c.email_list, c.ig_followers_total,
+  c.possibly_managed, c.profile_image, c.last_post_at, c.created_at, c.delivered_at, c.email_list, c.ig_followers_total, c.email_stage,
   (select k.value from contacts k where k.creator_id = c.id and k.type = 'email' and k.email_status <> 'invalid' order by k.found_at limit 1) as email,
   exists (select 1 from contacts k where k.creator_id = c.id and k.type = 'telegram') as has_telegram,
   (select p.url from platform_accounts p where p.creator_id = c.id and p.platform = 'onlyfans' limit 1) as onlyfans_url,
