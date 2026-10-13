@@ -123,6 +123,17 @@ export async function knownIds(ids) {
   return new Set(r.rows.map((x) => x.x_user_id));
 }
 
+// Handles that asked to be removed before we ever saw them (removal page).
+export async function removedHandles(handles) {
+  if (!handles.length) return new Set();
+  const r = await query("select lower(handle) as h from removal_requests where lower(handle) = any($1)", [handles.map((h) => String(h).toLowerCase())]);
+  return new Set(r.rows.map((x) => x.h));
+}
+
+export async function suppressId(xUserId, reason) {
+  await query("insert into suppression_list (x_user_id, reason) values ($1, $2) on conflict do nothing", [xUserId, reason]);
+}
+
 export async function markSeen(rows) {
   if (!rows.length) return;
   const cols = ["x_user_id", "handle", "outcome", "reason", "depth", "source_seed_id"];
