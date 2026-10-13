@@ -19,11 +19,15 @@ router.get("/api/admin/crawler", async (_req, res, next) => {
         (select count(*) from creators)::int                              as creators_total,
         (select count(*) from creators where created_at > now() - interval '24 hours')::int as creators_24h,
         (select count(distinct creator_id) from contacts where type = 'email')::int as creators_with_email,
+        (select count(*) from creators where email_list = 'eligible')::int     as email_list,
+        (select count(*) from creators where email_list = 'pending_ig')::int   as email_pending_ig,
+        (select count(*) from creators where email_list = 'under_review')::int as email_under_review,
         (select count(*) from creators where dm_open is true)::int        as creators_dm_open,
         (select count(*) from exclusions)::int                            as excluded_total`),
       one(`select coalesce(sum(cost_usd), 0)::float as total_usd,
                   coalesce(sum(cost_usd) filter (where provider = 'twitterapi'), 0)::float as twitterapi_usd,
-                  coalesce(sum(cost_usd) filter (where provider = 'openrouter'), 0)::float as openrouter_usd
+                  coalesce(sum(cost_usd) filter (where provider = 'openrouter'), 0)::float as openrouter_usd,
+                  coalesce(sum(cost_usd) filter (where provider = 'apify'), 0)::float as apify_usd
              from spend_log where day = (now() at time zone 'utc')::date`),
       one("select state, message, current_job, last_seen_at, started_at from worker_status where id = 1"),
       query(`select reason, count(*)::int as total from x_accounts_seen
