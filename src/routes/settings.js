@@ -1,10 +1,11 @@
 import { Router } from "express";
-import { query, one, activity } from "../lib/db.js";
+import { query, one, activity, pool } from "../lib/db.js";
 import { requireAdmin } from "../middleware/session.js";
 import { config } from "../config.js";
 
 const router = Router();
 router.use("/api/admin/settings", requireAdmin);
+router.use("/api/admin/reset-data", requireAdmin);
 
 // If active seeds < minimum, the crawler is switched off. Returns true if it switched it off.
 export async function enforceSeedLock() {
@@ -86,6 +87,33 @@ router.patch("/api/admin/settings", async (req, res, next) => {
     }
     res.json({ settings: saved });
   } catch (e) { next(e); }
+});
+
+// Clears test/old crawl results before a real run. Keeps: seeds, settings, inboxes, age-safety exclusions,
+// the do-not-contact list and the spend log (real money spent today still counts toward the budget).
+router.post("/api/admin/reset-data", async (req, res, next) => {
+  if (req.body?.confirm !== "DELETE") return res.status(400).json({ error: 'Type DELETE to confirm.' });
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const n = (await client.query("select count(*)::int as n from creators")).rows[0].n;
+    await client.query("update settings set crawler_enabled = false, email_sending_enabled = false, updated_at = now() where id = 1");
+    await client.query("delete from email_messages");
+    await client.query("delete from creators");               // also removes their contacts + platforms
+    await client.query("delete from deliveries");
+    await client.query("delete from crawl_jobs");
+    await client.query("delete from x_accounts_seen");
+    await client.query("delete from activity_log");
+    await client.query("delete from app_state where key like 'tg:%'");
+    await client.query("update seeds set accounts_pulled = 0, qualified_count = 0, last_crawled_at = null");
+    await client.query("update email_inboxes set last_uid = 0, uid_validity = null");
+    await client.query("commit");
+    await activity("settings", `All crawl data cleared (${n} leads removed). Crawler and email sending switched off.`);
+    res.json({ ok: true, removed: n });
+  } catch (e) {
+    await client.query("rollback").catch(() => {});
+    next(e);
+  } finally { client.release(); }
 });
 
 export default router;
