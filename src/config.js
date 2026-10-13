@@ -42,6 +42,20 @@ export const config = {
   costPerIgProfile: Number(process.env.COST_PER_IG_PROFILE || 0.0015),
   igBatchSize: 20,
 
+  // Email (Gmail App Passwords). SECRET_KEY encrypts the stored App Passwords — any long random text.
+  secretKey: process.env.SECRET_KEY?.trim() || null,
+  smtpHost: process.env.SMTP_HOST || "smtp.gmail.com",
+  smtpPort: Number(process.env.SMTP_PORT || 465),
+  imapHost: process.env.IMAP_HOST || "imap.gmail.com",
+  imapPort: Number(process.env.IMAP_PORT || 993),
+  mailTls: process.env.MAIL_TLS !== "0",          // only turned off for local testing
+  timezone: "Asia/Riyadh",
+
+  // Telegram channel updates (optional)
+  telegramToken: process.env.TELEGRAM_BOT_TOKEN?.trim() || null,
+  telegramChatId: process.env.TELEGRAM_CHAT_ID?.trim() || null,
+  telegramBase: process.env.TELEGRAM_BASE || "https://api.telegram.org",
+
   pollIdleMs: 30_000,
   pollBusyMs: 1_000,
 };
