@@ -1,6 +1,7 @@
 // All crawler database reads/writes (plain SQL on the Supabase tables).
 import { query, one, activity } from "../lib/db.js";
 import { log } from "./util.js";
+import { initialEmailList, MAX_IG_ACCOUNTS } from "./emailrules.js";
 
 export { activity };
 
@@ -142,24 +143,28 @@ export async function exclude(xUserId, handle, reason, depth, seedId) {
 }
 
 // ---------- Saving a qualified creator ----------
-export async function saveCreator(c, found) {
+export async function saveCreator(c, found, settings) {
+  // Email list status (plan 5.1). Only set when she's first saved; later re-saves keep it.
+  const list = initialEmailList({ xFollowers: c.followers, hasEmail: found.emails.size > 0, igHandles: [...found.instagram] }, settings);
   const row = await one(`
     insert into creators (x_user_id, handle, display_name, bio, x_followers, x_following, last_post_at, bio_link, resolved_link,
-      niche, tier, language, found_via_seed_id, depth, possibly_managed, llm_result, dm_open, dm_checked_at, profile_image, x_created_at)
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'english',$12,$13,$14,$15,$16,$17,$18,$19)
+      niche, tier, language, found_via_seed_id, depth, possibly_managed, llm_result, dm_open, dm_checked_at, profile_image, x_created_at,
+      email_list, email_list_reason)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'english',$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
     on conflict (x_user_id) do update set handle = excluded.handle, display_name = excluded.display_name, bio = excluded.bio,
       x_followers = excluded.x_followers, x_following = excluded.x_following, last_post_at = excluded.last_post_at,
       resolved_link = excluded.resolved_link, dm_open = excluded.dm_open, dm_checked_at = excluded.dm_checked_at, updated_at = now()
     returning id`,
     [c.id, c.handle, c.name, c.bio, c.followers, c.following, c.lastPostAt || null, c.links[0] || null, found.resolvedLink,
      c.ai?.niche || null, c.tier, c.seedId, c.depth, c.possiblyManaged, c.ai || null, c.canDm,
-     c.canDm == null ? null : new Date(), c.profileImage, c.createdAt && !isNaN(c.createdAt) ? c.createdAt : null]);
+     c.canDm == null ? null : new Date(), c.profileImage, c.createdAt && !isNaN(c.createdAt) ? c.createdAt : null,
+     list.status, list.reason]);
 
   const platforms = [["x", c.handle, `https://x.com/${c.handle}`, c.followers]];
   found.onlyfans.forEach((url) => platforms.push(["onlyfans", url.split("/").pop(), url, null]));
   found.fansly.forEach((url) => platforms.push(["fansly", url.split("/").pop(), url, null]));
   found.fanvue.forEach((url) => platforms.push(["fanvue", url.split("/").pop(), url, null]));
-  found.instagram.forEach((h) => platforms.push(["instagram", h, `https://instagram.com/${h}`, null]));
+  [...found.instagram].slice(0, MAX_IG_ACCOUNTS).forEach((h) => platforms.push(["instagram", h, `https://instagram.com/${h}`, null]));
   found.tiktok.forEach((h) => platforms.push(["tiktok", h, `https://tiktok.com/@${h}`, null]));
   for (const [platform, handle, url, followers] of platforms) {
     await query(`insert into platform_accounts (creator_id, platform, handle, url, followers, checked_at)
@@ -186,4 +191,45 @@ export async function queueCrawl(c, job) {
   await query(`insert into crawl_jobs (x_user_id, handle, depth, source_seed_id, root_seed_type)
                values ($1,$2,$3,$4,$5) on conflict (x_user_id) do nothing`,
     [c.id, c.handle, c.depth, job.source_seed_id, job.root_seed_type]);
+}
+
+// ---------- Instagram check queue (plan 5.1) ----------
+// Creators waiting for the Instagram check, with their linked Instagram usernames.
+export async function pendingInstagram(limit) {
+  return (await query(`
+    select c.id, c.handle,
+           coalesce((select array_agg(lower(p.handle) order by p.created_at) from platform_accounts p
+                      where p.creator_id = c.id and p.platform = 'instagram' and p.handle is not null), '{}') as ig
+      from creators c
+     where c.email_list = 'pending_ig' and c.ig_attempts < 3
+     order by c.created_at
+     limit $1`, [limit])).rows.map((r) => ({ ...r, ig: r.ig.slice(0, MAX_IG_ACCOUNTS) }));
+}
+
+export async function pendingInstagramCount() {
+  return Number((await one("select count(*) as n from creators where email_list = 'pending_ig'")).n);
+}
+
+// A failed check: try again later; after 3 failures she goes to under review.
+export async function instagramFailed(ids) {
+  if (!ids.length) return;
+  await query(`update creators set ig_attempts = ig_attempts + 1,
+                 email_list = case when ig_attempts + 1 >= 3 then 'under_review' else email_list end,
+                 email_list_reason = case when ig_attempts + 1 >= 3 then 'instagram_check_failed' else email_list_reason end,
+                 updated_at = now()
+               where id = any($1) and email_list = 'pending_ig'`, [ids]);
+}
+
+export async function saveInstagramResult(creatorId, profiles, decision) {
+  for (const p of profiles) {
+    await query(`update platform_accounts set followers = $1, checked_at = now()
+                  where creator_id = $2 and platform = 'instagram' and lower(handle) = $3`, [p.followers ?? null, creatorId, p.username]);
+    if (p.email) {
+      await query(`insert into contacts (creator_id, type, value, source) values ($1, 'email', $2, 'instagram')
+                   on conflict (creator_id, type, value) do nothing`, [creatorId, p.email]);
+    }
+  }
+  await query(`update creators set email_list = $1, email_list_reason = $2, ig_followers_total = $3, ig_checked_at = now(),
+                 ig_attempts = ig_attempts + 1, updated_at = now()
+               where id = $4 and email_list = 'pending_ig'`, [decision.status, decision.reason, decision.total, creatorId]);
 }
