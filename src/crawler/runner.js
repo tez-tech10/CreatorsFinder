@@ -4,6 +4,8 @@ import { config } from "../config.js";
 import { log, sleep, requestStop, isStopping } from "./util.js";
 import * as store from "./store.js";
 import { processJob, BudgetReached } from "./pipeline.js";
+import { fetchProfiles, InstagramUnavailable } from "./instagram.js";
+import { afterInstagram } from "./emailrules.js";
 
 async function lane(n) {
   while (!isStopping()) {
@@ -86,6 +88,72 @@ async function lane(n) {
   }
 }
 
+// Instagram check lane (plan 5.1): runs on its own so a slow Instagram service never slows the X crawl.
+// Only creators with an email and X followers between the two limits ever reach it.
+let igNotice = null;
+async function igNote(msg) {
+  if (msg === igNotice) return;
+  igNotice = msg;
+  if (msg) { log("[instagram]", msg); await store.activity("instagram", msg).catch(() => {}); }
+}
+
+async function instagramLane() {
+  while (!isStopping()) {
+    try { await instagramTick(); }
+    catch (e) { log("[instagram] error:", e.message); await sleep(60_000); }
+  }
+}
+
+export async function instagramTick() {
+  let settings;
+  try { settings = await store.getSettings(); } catch { await sleep(config.pollIdleMs); return; }
+  // Follows the main crawler switch, so "off" means nothing is spent anywhere
+  if (!settings.crawler_enabled || !settings.ig_check_enabled) { await sleep(config.pollIdleMs); return; }
+
+  let batch;
+  try { batch = await store.pendingInstagram(config.igBatchSize); }
+  catch (e) { log("[instagram] queue read failed:", e.message); await sleep(config.pollIdleMs); return; }
+  if (!batch.length) { await sleep(config.pollIdleMs); return; }
+
+  if (!config.apifyToken) { await igNote(`${batch.length}+ creators are waiting for the Instagram check, but APIFY_TOKEN isn't set in Railway.`); await sleep(5 * 60_000); return; }
+
+  // Same daily budget as the X crawl
+  let spent;
+  try { spent = await store.spentToday(); } catch { await sleep(config.pollIdleMs); return; }
+  if (spent >= Number(settings.daily_budget_usd)) { await sleep(5 * 60_000); return; }
+
+  // Anyone queued without a linked Instagram goes straight to review (no request needed)
+  const noIg = batch.filter((c) => !c.ig.length);
+  for (const c of noIg) await store.saveInstagramResult(c.id, [], { status: "under_review", reason: "no_instagram", total: null });
+  const work = batch.filter((c) => c.ig.length);
+  if (!work.length) return;
+
+  const usernames = [...new Set(work.flatMap((c) => c.ig))];
+  let profiles;
+  try {
+    profiles = await fetchProfiles(usernames);
+    await store.recordSpend("apify", "instagram_profiles", usernames.length, usernames.length * config.costPerIgProfile, { found: profiles.size });
+    // Nothing at all came back: the service is having trouble. Don't judge anyone on that.
+    if (!profiles.size) throw new Error("Apify returned no profiles");
+    await igNote(null);
+  } catch (e) {
+    if (e instanceof InstagramUnavailable) { await igNote(`Instagram check paused: ${e.message}`); await sleep(10 * 60_000); return; }
+    log("[instagram] request failed:", e.message);
+    await store.instagramFailed(work.map((c) => c.id));
+    await sleep(60_000); return;
+  }
+
+  let eligible = 0;
+  for (const c of work) {
+    const mine = c.ig.map((u) => profiles.get(u) || { username: u, found: false, followers: null });
+    const decision = afterInstagram(mine.map((p) => p.followers), settings);
+    await store.saveInstagramResult(c.id, mine, decision);
+    if (decision.status === "eligible") eligible++;
+  }
+  log(`[instagram] checked ${work.length} creators (${usernames.length} accounts): ${eligible} to email list, ${work.length - eligible} under review`);
+  await sleep(config.pollBusyMs);
+}
+
 let running = null;
 
 export function startCrawler() {
@@ -93,7 +161,7 @@ export function startCrawler() {
   running = (async () => {
     try { await store.markStarted(); } catch {}
     await store.heartbeat("idle", "Crawler started");
-    await Promise.all([lane(1), lane(2), lane(3)]);
+    await Promise.all([lane(1), lane(2), lane(3), instagramLane()]);
     await store.heartbeat("offline", "Crawler stopped");
     log("Crawler stopped.");
   })().catch(async (e) => {
