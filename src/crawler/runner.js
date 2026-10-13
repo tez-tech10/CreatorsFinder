@@ -6,6 +6,10 @@ import * as store from "./store.js";
 import { processJob, BudgetReached } from "./pipeline.js";
 import { fetchProfiles, InstagramUnavailable } from "./instagram.js";
 import { afterInstagram } from "./emailrules.js";
+import { notify, notifyOnce } from "../lib/telegram.js";
+import { sendTick, readTick } from "../email/engine.js";
+
+const today = () => new Date().toISOString().slice(0, 10);
 
 async function lane(n) {
   while (!isStopping()) {
@@ -28,7 +32,10 @@ async function lane(n) {
     try {
       const active = await store.activeSeedCount();
       if (active < settings.min_seeds) {
-        if (n === 1) await store.switchCrawlerOff(`only ${active} active seeds (minimum ${settings.min_seeds})`);
+        if (n === 1) {
+          await store.switchCrawlerOff(`only ${active} active seeds (minimum ${settings.min_seeds})`);
+          await notify(`[crawler] Switched off: only ${active} active seeds (minimum ${settings.min_seeds}). Add seeds, then switch it back on.`);
+        }
         await sleep(config.pollIdleMs); continue;
       }
     } catch (e) { log(`[lane ${n}] seed check failed:`, e.message); await sleep(config.pollIdleMs); continue; }
@@ -40,7 +47,10 @@ async function lane(n) {
       log(`[lane ${n}] can't read spending:`, e.message); await sleep(config.pollIdleMs); continue;
     }
     if (spent >= Number(settings.daily_budget_usd)) {
-      if (n === 1) await store.heartbeat("budget_reached", `Today's budget is used ($${spent.toFixed(2)} of $${settings.daily_budget_usd}). Resumes tomorrow (UTC) or when you raise the budget.`);
+      if (n === 1) {
+        await store.heartbeat("budget_reached", `Today's budget is used ($${spent.toFixed(2)} of $${settings.daily_budget_usd}). Resumes tomorrow (UTC) or when you raise the budget.`);
+        await notifyOnce(`budget:${today()}`, `[crawler] Daily budget reached: $${spent.toFixed(2)} of $${settings.daily_budget_usd}. Paused until tomorrow (UTC) or until you raise the budget in Settings.`);
+      }
       await sleep(5 * 60_000); continue;
     }
 
@@ -81,6 +91,7 @@ async function lane(n) {
       await store.activity("pipeline", `Error on @${job.handle}: ${e.message}`, { attempt: job.attempts });
       await store.heartbeat("error", e.message);
       log(`[lane ${n}] error @${job.handle}:`, e.message);
+      await notifyOnce(`crawlerr:${new Date().toISOString().slice(0, 13)}`, `[crawler] Problem while crawling @${job.handle}: ${String(e.message).slice(0, 200)}${failed ? "\nThis account was skipped after 3 tries." : "\nIt will retry automatically."}`);
       await sleep(e.fatal ? 10 * 60_000 : 15_000);
       continue;
     }
@@ -94,7 +105,11 @@ let igNotice = null;
 async function igNote(msg) {
   if (msg === igNotice) return;
   igNotice = msg;
-  if (msg) { log("[instagram]", msg); await store.activity("instagram", msg).catch(() => {}); }
+  if (msg) {
+    log("[instagram]", msg);
+    await store.activity("instagram", msg).catch(() => {});
+    await notifyOnce(`ig:${today()}:${msg.slice(0, 60)}`, `[instagram] ${msg}`);
+  }
 }
 
 async function instagramLane() {
@@ -154,6 +169,20 @@ export async function instagramTick() {
   await sleep(config.pollBusyMs);
 }
 
+// Email lane: sends when it's due (every 30s check) and reads replies every 3 minutes.
+// Independent of the crawler switch: it has its own "Sending on" switch on the Email page.
+let lastRead = 0;
+async function emailLane() {
+  while (!isStopping()) {
+    try {
+      const settings = await store.getSettings();
+      if (Date.now() - lastRead > 3 * 60_000) { lastRead = Date.now(); await readTick(); }
+      await sendTick(settings);
+    } catch (e) { log("[email] error:", e.message); }
+    await sleep(30_000);
+  }
+}
+
 let running = null;
 
 export function startCrawler() {
@@ -161,7 +190,7 @@ export function startCrawler() {
   running = (async () => {
     try { await store.markStarted(); } catch {}
     await store.heartbeat("idle", "Crawler started");
-    await Promise.all([lane(1), lane(2), lane(3), instagramLane()]);
+    await Promise.all([lane(1), lane(2), lane(3), instagramLane(), emailLane()]);
     await store.heartbeat("offline", "Crawler stopped");
     log("Crawler stopped.");
   })().catch(async (e) => {
